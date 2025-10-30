@@ -253,13 +253,17 @@ class PosPaymentAPI(http.Controller):
                 domain.append(('lines.product_id', '=', int(id_produit)))
 
             pos_orders = request.env['pos.order'].sudo().search(domain)
-
             payment_data = []
             for order in pos_orders:
                 payment_methods = {}
 
                 for payment in order.payment_ids:
-                    payment_methods[payment.payment_method_id.name] = payment.amount
+                    method_name = payment.payment_method_id.name
+                    # Add to existing amount if method already exists, otherwise create new entry
+                    if method_name in payment_methods:
+                        payment_methods[method_name] += payment.amount
+                    else:
+                        payment_methods[method_name] = payment.amount
 
                 id_ticket_with_prefix = f"70001{order.id}" if order.id else "70001"
                 id_ticket_caisse_with_prefix = f"70001 {order.pos_reference}" if order.pos_reference else "70001"
