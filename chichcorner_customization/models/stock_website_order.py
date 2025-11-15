@@ -237,7 +237,8 @@ class WebsiteOrder(models.Model):
                 colis_lines = active_lines.filtered(lambda l: l.numero_colis == colis_num)
 
                 # Calculate total amount for this colis
-                total_amount = sum(line.price * line.quantity for line in colis_lines)
+                #total_amount = sum(line.price * line.quantity for line in colis_lines)
+                total_amount = sum(line.price_payed for line in colis_lines)
 
                 # Prepare products description with name and barcode
                 products_description = ", ".join([
@@ -1326,7 +1327,7 @@ class WebsiteOrder(models.Model):
 
         for line in lines:
             discount_amount = (line.discount or 0.0) / 100.0
-            price_unit = float(line.price)
+            price_unit = float(line.price_payed)
             qty = float(line.quantity)
             taxes = line.product_id.taxes_id.filtered(lambda t: t.company_id == self.env.company)
             tax_rate = taxes[0].amount / 100.0 if taxes else 0.20
@@ -1484,6 +1485,7 @@ class StockWebsiteOrderLine(models.Model):
     product_name = fields.Char(string="Nom du Produit")
     quantity = fields.Float(string="Quantité")
     price = fields.Float(string="Prix", compute="_compute_price_from_pricelist", store=True)
+    price_payed = fields.Float(string="Prix Payé", store=True)
     discount = fields.Float(string="Remise")
     magasin_name = fields.Char(string="Magasin", compute="_compute_magasin_and_stock", store=True,
                                help="Nom du magasin où le produit est stocké")
