@@ -3,7 +3,12 @@ from odoo.http import request
 import json
 from odoo.exceptions import AccessDenied
 import werkzeug.exceptions
-
+import requests
+import werkzeug
+from datetime import datetime, timedelta
+import logging
+import re
+import base64
 
 def validate_api_key(api_key):
     """Validate the API key and return the associated user if valid"""
@@ -136,6 +141,756 @@ class DimensionProduitAPI(http.Controller):
                 status=500,
                 content_type="application/json"
             )
+class PosSalesExportAPI(http.Controller):
+
+    API_KEY = "5c8737045ad4abc7ed519a3932d1e5ce65c8ffd9"
+
+    @http.route(
+        "/api/pos_sales",
+        auth="none",
+        type="http",
+        methods=["GET"],
+        csrf=False
+    )
+    def get_pos_sales(self, startDate=None, endDate=None, **kwargs):
+
+        try:
+            api_key = request.httprequest.headers.get("Authorization")
+
+            if api_key != self.API_KEY:
+                return http.Response(
+                    json.dumps({
+                        "error": "Invalid or missing API key"
+                    }),
+                    status=401,
+                    content_type="application/json"
+                )
+
+            sales_data = self._get_pos_sales(
+                startDate,
+                endDate
+            )
+
+            return request.make_json_response(
+                sales_data,
+                status=200
+            )
+
+        except Exception as e:
+
+            error_message = (
+                f"Error fetching POS sales: {str(e)}"
+            )
+
+            request.env.cr.rollback()
+
+            return http.Response(
+                json.dumps({
+                    "error": "Internal Server Error",
+                    "details": error_message
+                }),
+                status=500,
+                content_type="application/json"
+            )
+
+    # =========================================================
+    # EXTRACT PROMOTION PERCENTAGE
+    # =========================================================
+
+    def _extract_promotion_percentage(self, promotion_line):
+
+        product_name = (
+            promotion_line.product_id.display_name
+            or promotion_line.name
+            or ""
+        )
+
+        match = re.search(
+            r'(\d+(?:[.,]\d+)?)\s*%',
+            product_name
+        )
+
+        if not match:
+            return None
+
+        percentage = match.group(1)
+
+        percentage = percentage.replace(",", ".")
+
+        return float(percentage)
+
+    # =========================================================
+    # FIND PRODUCTS TO WHICH THE PROMOTION APPLIES
+    # =========================================================
+
+    def _find_discounted_lines(
+        self,
+        product_lines,
+        promotion_percentage,
+        promotion_amount
+    ):
+
+        """
+        Find the combination of products for which:
+
+            sum(product subtotal * promotion %) = promotion amount
+
+        Example:
+
+            Product 1 subtotal = 1600
+            Product 2 subtotal = 2000
+            Product 3 subtotal = 2450
+
+            Promotion = 10%
+            Promotion amount = 360
+
+            1600 * 10% = 160
+            2000 * 10% = 200
+
+            160 + 200 = 360
+
+        Therefore Product 1 + Product 2 receive the promotion.
+        """
+
+        if not product_lines:
+            return []
+
+        target = abs(promotion_amount)
+
+        # -----------------------------------------------------
+        # Calculate expected discount for each product
+        # using price_subtotal_incl.
+        # -----------------------------------------------------
+
+        candidates = []
+
+        for line in product_lines:
+
+            subtotal = abs(line.price_subtotal_incl)
+
+            expected_discount = (
+                subtotal
+                * promotion_percentage
+                / 100
+            )
+
+            candidates.append({
+                "line": line,
+                "subtotal": subtotal,
+                "discount": expected_discount,
+            })
+
+        # -----------------------------------------------------
+        # Find a combination whose discount equals the
+        # promotion amount.
+        #
+        # Example:
+        #
+        # 160 + 200 + 245 = ...
+        #
+        # We search for the combination that gives 360.
+        # -----------------------------------------------------
+
+        def find_combination(
+            index,
+            current_total,
+            selected_lines
+        ):
+
+            # Small tolerance for decimal calculations
+            if abs(current_total - target) < 0.01:
+                return selected_lines
+
+            if current_total > target + 0.01:
+                return None
+
+            if index >= len(candidates):
+                return None
+
+            # -------------------------------------------------
+            # Try including current product
+            # -------------------------------------------------
+
+            candidate = candidates[index]
+
+            result = find_combination(
+                index + 1,
+                current_total + candidate["discount"],
+                selected_lines + [candidate["line"]]
+            )
+
+            if result is not None:
+                return result
+
+            # -------------------------------------------------
+            # Try without current product
+            # -------------------------------------------------
+
+            result = find_combination(
+                index + 1,
+                current_total,
+                selected_lines
+            )
+
+            return result
+
+        result = find_combination(
+            0,
+            0,
+            []
+        )
+
+        return result or []
+
+    # =========================================================
+    # GET POS SALES
+    # =========================================================
+
+    def _get_pos_sales(self, start_date, end_date):
+
+        domain = []
+
+        if start_date:
+            domain.append(
+                ("date_order", ">=", start_date)
+            )
+
+        if end_date:
+            domain.append(
+                ("date_order", "<=", end_date)
+            )
+
+        pos_orders = request.env[
+            "pos.order"
+        ].sudo().search(
+            domain,
+            order="date_order asc, id asc"
+        )
+
+        sales_data = []
+
+        for order in pos_orders:
+
+            store_code = (
+                order.config_id.name
+                if order.config_id
+                else ""
+            )
+
+            currency = (
+                order.currency_id.name
+                if order.currency_id
+                else ""
+            )
+
+            # =================================================
+            # SEPARATE PRODUCT AND PROMOTION LINES
+            # =================================================
+
+            product_lines = []
+            promotion_lines = []
+
+            for line in order.lines:
+
+                # Negative price = promotion line
+                if line.price_unit < 0:
+                    promotion_lines.append(line)
+
+                else:
+                    product_lines.append(line)
+
+            # =================================================
+            # FIND DISCOUNTED PRODUCTS
+            # =================================================
+
+            discounted_lines = {}
+
+            # We process each promotion line
+            for promotion_line in promotion_lines:
+
+                promotion_percentage = (
+                    self._extract_promotion_percentage(
+                        promotion_line
+                    )
+                )
+
+                if promotion_percentage is None:
+                    continue
+
+                promotion_amount = abs(
+                    promotion_line.price_subtotal_incl
+                    if promotion_line.price_subtotal_incl
+                    else promotion_line.price_unit
+                )
+
+                # -------------------------------------------------
+                # Find products whose subtotal percentages match
+                # the promotion amount.
+                # -------------------------------------------------
+
+                matching_lines = self._find_discounted_lines(
+                    product_lines,
+                    promotion_percentage,
+                    promotion_amount
+                )
+
+                for line in matching_lines:
+
+                    discounted_lines[line.id] = (
+                        promotion_percentage
+                    )
+
+            # =================================================
+            # EXPORT PRODUCT LINES
+            # =================================================
+
+            item_no = 0
+
+            for line in product_lines:
+
+                item_no += 1
+
+                tax_rate = 0
+
+                if line.tax_ids:
+
+                    tax_rate = int(
+                        round(
+                            line.tax_ids[0].amount
+                        )
+                    )
+
+                qty = line.qty
+
+                # =================================================
+                # ORIGINAL SUBTOTAL INCLUDING QUANTITY
+                # =================================================
+
+                sales_amount = abs(
+                    line.price_subtotal_incl
+                )
+
+                # =================================================
+                # APPLY PROMOTION
+                # =================================================
+
+                if line.id in discounted_lines:
+
+                    promotion_percentage = (
+                        discounted_lines[line.id]
+                    )
+
+                    # IMPORTANT:
+                    #
+                    # We calculate the discount from
+                    # price_subtotal_incl, NOT price_unit.
+                    #
+                    # Example:
+                    #
+                    # qty = 2
+                    # subtotal = 1600
+                    # promo = 10%
+                    #
+                    # discount = 1600 * 10% = 160
+                    #
+                    # final = 1600 - 160 = 1440
+
+                    discount_value = (
+                        sales_amount
+                        * promotion_percentage
+                        / 100
+                    )
+
+                    sales_amount = (
+                        sales_amount
+                        - discount_value
+                    )
+
+                    if sales_amount < 0:
+                        sales_amount = 0
+
+                # =================================================
+                # TRANSACTION TYPE
+                # =================================================
+
+                transaction_type = (
+                    "Refund"
+                    if qty < 0
+                    else "Sale"
+                )
+
+                # =================================================
+                # ADD RESULT
+                # =================================================
+
+                sales_data.append({
+
+                    "StoreCode": store_code,
+
+                    "CreatedDate": (
+                        order.date_order.strftime(
+                            "%Y-%m-%dT%H:%M:%S"
+                        )
+                        if order.date_order
+                        else None
+                    ),
+
+                    "LastUpdatedDate": (
+                        order.write_date.strftime(
+                            "%Y-%m-%dT%H:%M:%S"
+                        )
+                        if order.write_date
+                        else None
+                    ),
+
+                    "InvoiceNo": (
+                        order.pos_reference
+                        or order.name
+                    ),
+
+                    "InvoiceItemNo": item_no,
+
+                    "TransactionType": transaction_type,
+
+                    "Barcode": (
+                        line.product_id.barcode
+                        or ""
+                    ),
+
+                    "SalesAmount": sales_amount,
+
+                    "Currency": currency,
+
+                    "SalesQuantity": abs(qty),
+
+                    "TaxRate": tax_rate,
+
+                    "InitialSalePrice": line.price_unit,
+                })
+
+            # =================================================
+            # PROMOTION LINES ARE NOT EXPORTED
+            # =================================================
+
+        return sales_data
+class StockDataAPI(http.Controller):
+
+    API_KEY = "5c8737045ad4abc7ed519a3932d1e5ce65c8ffd9"
+
+    @http.route(
+        "/api/stock_data",
+        auth="none",
+        type="http",
+        methods=["GET"],
+        csrf=False
+    )
+    def get_stock_data(
+        self,
+        startDate=None,
+        endDate=None,
+        **kwargs
+    ):
+
+        try:
+
+            # =====================================================
+            # AUTHENTICATION
+            # =====================================================
+
+            api_key = request.httprequest.headers.get(
+                "Authorization"
+            )
+
+            if api_key != self.API_KEY:
+
+                return http.Response(
+                    json.dumps({
+                        "error": "Invalid or missing API key"
+                    }),
+                    status=401,
+                    content_type="application/json"
+                )
+
+            # =====================================================
+            # VALIDATE DATES
+            # =====================================================
+
+            if not startDate or not endDate:
+
+                return http.Response(
+                    json.dumps({
+                        "error": "startDate and endDate are required"
+                    }),
+                    status=400,
+                    content_type="application/json"
+                )
+
+            try:
+
+                start_date = datetime.strptime(
+                    startDate,
+                    "%Y-%m-%d"
+                ).date()
+
+                end_date = datetime.strptime(
+                    endDate,
+                    "%Y-%m-%d"
+                ).date()
+
+            except ValueError:
+
+                return http.Response(
+                    json.dumps({
+                        "error": (
+                            "Invalid date format. "
+                            "Use YYYY-MM-DD"
+                        )
+                    }),
+                    status=400,
+                    content_type="application/json"
+                )
+
+            if start_date > end_date:
+
+                return http.Response(
+                    json.dumps({
+                        "error": (
+                            "startDate cannot be greater "
+                            "than endDate"
+                        )
+                    }),
+                    status=400,
+                    content_type="application/json"
+                )
+
+            # =====================================================
+            # GET STOCK
+            # =====================================================
+
+            stock_data = self._get_stock_data(
+                start_date,
+                end_date
+            )
+
+            return request.make_json_response(
+                stock_data,
+                status=200
+            )
+
+        except Exception as e:
+
+            request.env.cr.rollback()
+
+            return http.Response(
+                json.dumps({
+                    "error": "Internal Server Error",
+                    "details": str(e)
+                }),
+                status=500,
+                content_type="application/json"
+            )
+
+    # =========================================================
+    # GET STOCK DATA
+    # =========================================================
+
+    def _get_stock_data(
+        self,
+        start_date,
+        end_date
+    ):
+
+        result = []
+
+        current_date = start_date
+
+        while current_date <= end_date:
+
+            daily_stock = self._get_stock_for_date(
+                current_date
+            )
+
+            result.extend(daily_stock)
+
+            current_date += timedelta(days=1)
+
+        return result
+
+    # =========================================================
+    # GET STOCK FOR ONE DAY
+    # =========================================================
+
+    def _get_stock_for_date(self, stock_date):
+
+        StockQuant = request.env[
+            "stock.quant"
+        ].sudo()
+
+        StockMoveLine = request.env[
+            "stock.move.line"
+        ].sudo()
+
+        # =====================================================
+        # END OF DAY
+        # =====================================================
+
+        date_end = datetime.combine(
+            stock_date,
+            datetime.max.time()
+        )
+
+        # =====================================================
+        # CURRENT STOCK
+        # =====================================================
+
+        quants = StockQuant.search([
+            ("location_id.usage", "in", [
+                "internal"
+            ])
+        ])
+
+        stock_by_product_location = {}
+
+        for quant in quants:
+
+            product_id = quant.product_id.id
+            location_id = quant.location_id.id
+
+            key = (
+                product_id,
+                location_id
+            )
+
+            stock_by_product_location[key] = (
+                stock_by_product_location.get(key, 0)
+                + quant.quantity
+            )
+
+        # =====================================================
+        # REVERSE STOCK MOVEMENTS AFTER REQUESTED DATE
+        # =====================================================
+
+        future_moves = StockMoveLine.search([
+            ("state", "=", "done"),
+            (
+                "date",
+                ">",
+                date_end.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            )
+        ])
+
+        for move_line in future_moves:
+
+            product_id = move_line.product_id.id
+
+            quantity = move_line.quantity
+
+            source_location = (
+                move_line.location_id
+            )
+
+            destination_location = (
+                move_line.location_dest_id
+            )
+
+            # =================================================
+            # SOURCE LOCATION
+            #
+            # A future movement decreased the source.
+            # Therefore we ADD it back when reconstructing
+            # historical stock.
+            # =================================================
+
+            if source_location.usage == "internal":
+
+                key = (
+                    product_id,
+                    source_location.id
+                )
+
+                stock_by_product_location[key] = (
+                    stock_by_product_location.get(
+                        key,
+                        0
+                    )
+                    + quantity
+                )
+
+            # =================================================
+            # DESTINATION LOCATION
+            #
+            # A future movement increased the destination.
+            # Therefore we REMOVE it when reconstructing
+            # historical stock.
+            # =================================================
+
+            if destination_location.usage == "internal":
+
+                key = (
+                    product_id,
+                    destination_location.id
+                )
+
+                stock_by_product_location[key] = (
+                    stock_by_product_location.get(
+                        key,
+                        0
+                    )
+                    - quantity
+                )
+
+        # =====================================================
+        # BUILD RESPONSE
+        # =====================================================
+
+        result = []
+
+        for (
+            product_location,
+            quantity
+        ) in stock_by_product_location.items():
+
+            product_id = product_location[0]
+            location_id = product_location[1]
+
+            product = request.env[
+                "product.product"
+            ].sudo().browse(product_id)
+
+            location = request.env[
+                "stock.location"
+            ].sudo().browse(location_id)
+
+            # Ignore zero stock
+            if abs(quantity) < 0.0001:
+                continue
+
+            result.append({
+
+                "Date": stock_date.strftime(
+                    "%Y-%m-%d"
+                ),
+
+                "StoreCode": (
+                    location.complete_name
+                    or location.name
+                ),
+
+                "Barcode": (
+                    product.barcode
+                    or ""
+                ),
+
+                "ProductID": product.id,
+
+                "ProductName": product.display_name,
+
+                "Quantity": quantity,
+            })
+
+        return result
 
 #sales_api -- id existe - deployé
 class PosOrderAPI(http.Controller):
