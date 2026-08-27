@@ -573,6 +573,7 @@ class PosSalesExportAPI(http.Controller):
             # =================================================
 
         return sales_data
+
 class StockDataAPI(http.Controller):
 
     API_KEY = "5c8737045ad4abc7ed519a3932d1e5ce65c8ffd9"
@@ -690,9 +691,25 @@ class StockDataAPI(http.Controller):
                 content_type="application/json"
             )
 
-    # =========================================================
-    # GET STOCK DATA
-    # =========================================================
+    # =============================================================
+    # GET STOCK DATA (single pass over the whole date range)
+    # =============================================================
+    #
+    # Instead of recomputing "current quants" and re-scanning
+    # "all future moves" once PER DAY (which is what made this
+    # timeout with 9571+ products), we now:
+    #
+    #   1. Load quants ONCE.
+    #   2. Load all relevant move lines ONCE, sorted newest first.
+    #   3. Walk backward day by day, only ever touching each move
+    #      line exactly once, applying its reversal as we cross
+    #      its date going backward in time.
+    #   4. Batch-fetch product/location display data ONCE instead
+    #      of browsing one record at a time in a loop.
+    #
+    # This turns the cost from O(days x (quants + moves)) into
+    # O(quants + moves), regardless of how many days are requested.
+    # =============================================================
 
     def _get_stock_data(
         self,
@@ -700,198 +717,166 @@ class StockDataAPI(http.Controller):
         end_date
     ):
 
-        result = []
-
-        current_date = start_date
-
-        while current_date <= end_date:
-
-            daily_stock = self._get_stock_for_date(
-                current_date
-            )
-
-            result.extend(daily_stock)
-
-            current_date += timedelta(days=1)
-
-        return result
-
-    # =========================================================
-    # GET STOCK FOR ONE DAY
-    # =========================================================
-
-    def _get_stock_for_date(self, stock_date):
-
-        StockQuant = request.env[
-            "stock.quant"
-        ].sudo()
-
-        StockMoveLine = request.env[
-            "stock.move.line"
-        ].sudo()
+        StockQuant = request.env["stock.quant"].sudo()
+        StockMoveLine = request.env["stock.move.line"].sudo()
+        Product = request.env["product.product"].sudo()
+        Location = request.env["stock.location"].sudo()
 
         # =====================================================
-        # END OF DAY
-        # =====================================================
-
-        date_end = datetime.combine(
-            stock_date,
-            datetime.max.time()
-        )
-
-        # =====================================================
-        # CURRENT STOCK
+        # 1) CURRENT STOCK — fetched ONCE
         # =====================================================
 
         quants = StockQuant.search([
-            ("location_id.usage", "in", [
-                "internal"
-            ])
+            ("location_id.usage", "=", "internal")
         ])
 
-        stock_by_product_location = {}
+        stock_by_key = {}
 
         for quant in quants:
 
-            product_id = quant.product_id.id
-            location_id = quant.location_id.id
-
             key = (
-                product_id,
-                location_id
+                quant.product_id.id,
+                quant.location_id.id
             )
 
-            stock_by_product_location[key] = (
-                stock_by_product_location.get(key, 0)
+            stock_by_key[key] = (
+                stock_by_key.get(key, 0)
                 + quant.quantity
             )
 
         # =====================================================
-        # REVERSE STOCK MOVEMENTS AFTER REQUESTED DATE
+        # 2) ALL RELEVANT MOVE LINES — fetched ONCE,
+        #    newest first, so we can consume them
+        #    incrementally while walking backward.
         # =====================================================
+
+        earliest_cutoff = datetime.combine(
+            start_date,
+            datetime.max.time()
+        )
 
         future_moves = StockMoveLine.search([
             ("state", "=", "done"),
-            (
-                "date",
-                ">",
-                date_end.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-            )
-        ])
+            ("date", ">", earliest_cutoff.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ))
+        ], order="date desc")
 
-        for move_line in future_moves:
-
-            product_id = move_line.product_id.id
-
-            quantity = move_line.quantity
-
-            source_location = (
-                move_line.location_id
-            )
-
-            destination_location = (
-                move_line.location_dest_id
-            )
-
-            # =================================================
-            # SOURCE LOCATION
-            #
-            # A future movement decreased the source.
-            # Therefore we ADD it back when reconstructing
-            # historical stock.
-            # =================================================
-
-            if source_location.usage == "internal":
-
-                key = (
-                    product_id,
-                    source_location.id
-                )
-
-                stock_by_product_location[key] = (
-                    stock_by_product_location.get(
-                        key,
-                        0
-                    )
-                    + quantity
-                )
-
-            # =================================================
-            # DESTINATION LOCATION
-            #
-            # A future movement increased the destination.
-            # Therefore we REMOVE it when reconstructing
-            # historical stock.
-            # =================================================
-
-            if destination_location.usage == "internal":
-
-                key = (
-                    product_id,
-                    destination_location.id
-                )
-
-                stock_by_product_location[key] = (
-                    stock_by_product_location.get(
-                        key,
-                        0
-                    )
-                    - quantity
-                )
+        moves_list = list(future_moves)
 
         # =====================================================
-        # BUILD RESPONSE
+        # 3) BATCH-PREFETCH product / location display data
+        #    (avoids one-by-one browse() calls in a loop)
+        # =====================================================
+
+        product_ids = set(quants.mapped("product_id").ids)
+        location_ids = set(quants.mapped("location_id").ids)
+
+        for move_line in moves_list:
+            product_ids.add(move_line.product_id.id)
+            location_ids.add(move_line.location_id.id)
+            location_ids.add(move_line.location_dest_id.id)
+
+        products = Product.browse(list(product_ids))
+        locations = Location.browse(list(location_ids))
+
+        products_data = {
+            p.id: (p.barcode or "", p.display_name)
+            for p in products
+        }
+
+        locations_name = {
+            l.id: (l.complete_name or l.name)
+            for l in locations
+        }
+
+        locations_usage = {
+            l.id: l.usage
+            for l in locations
+        }
+
+        # =====================================================
+        # 4) WALK BACKWARD DAY BY DAY, applying only the
+        #    slice of moves that falls after each day's
+        #    cutoff, consuming moves_list exactly once total.
         # =====================================================
 
         result = []
 
-        for (
-            product_location,
-            quantity
-        ) in stock_by_product_location.items():
+        current_date = end_date
+        move_idx = 0
+        total_moves = len(moves_list)
 
-            product_id = product_location[0]
-            location_id = product_location[1]
+        while current_date >= start_date:
 
-            product = request.env[
-                "product.product"
-            ].sudo().browse(product_id)
+            date_end = datetime.combine(
+                current_date,
+                datetime.max.time()
+            )
 
-            location = request.env[
-                "stock.location"
-            ].sudo().browse(location_id)
+            while (
+                move_idx < total_moves
+                and moves_list[move_idx].date > date_end
+            ):
 
-            # Ignore zero stock
-            if abs(quantity) < 0.0001:
-                continue
+                move_line = moves_list[move_idx]
 
-            result.append({
+                product_id = move_line.product_id.id
+                quantity = move_line.quantity
+                source_id = move_line.location_id.id
+                dest_id = move_line.location_dest_id.id
 
-                "Date": stock_date.strftime(
-                    "%Y-%m-%d"
-                ),
+                # SOURCE: a future movement decreased it,
+                # so we ADD it back when going backward.
+                if locations_usage.get(source_id) == "internal":
 
-                "StoreCode": (
-                    location.complete_name
-                    or location.name
-                ),
+                    key = (product_id, source_id)
 
-                "Barcode": (
-                    product.barcode
-                    or ""
-                ),
+                    stock_by_key[key] = (
+                        stock_by_key.get(key, 0)
+                        + quantity
+                    )
 
-                "ProductID": product.id,
+                # DESTINATION: a future movement increased it,
+                # so we REMOVE it when going backward.
+                if locations_usage.get(dest_id) == "internal":
 
-                "ProductName": product.display_name,
+                    key = (product_id, dest_id)
 
-                "Quantity": quantity,
-            })
+                    stock_by_key[key] = (
+                        stock_by_key.get(key, 0)
+                        - quantity
+                    )
+
+                move_idx += 1
+
+            # ---------------------------------------------------
+            # Snapshot for this day
+            # ---------------------------------------------------
+
+            date_str = current_date.strftime("%Y-%m-%d")
+
+            for (product_id, location_id), quantity in stock_by_key.items():
+
+                if abs(quantity) < 0.0001:
+                    continue
+
+                barcode, product_name = products_data.get(
+                    product_id, ("", "")
+                )
+
+                result.append({
+                    "Date": date_str,
+                    "StoreCode": locations_name.get(location_id, ""),
+                    "Barcode": barcode,
+                    "ProductID": product_id,
+                    "ProductName": product_name,
+                    "Quantity": quantity,
+                })
+
+            current_date -= timedelta(days=1)
 
         return result
-
 #sales_api -- id existe - deployé
 class PosOrderAPI(http.Controller):
 
