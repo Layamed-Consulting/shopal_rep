@@ -34,6 +34,8 @@
         'views/product_view_inh.xml',
         'data/auto_send_order.xml',
         'data/cron.xml',
+        'data/cron_pos.xml',
+        'data/stock_api_cron.xml',
         'data/cron_status_prestashop.xml',
         'data/croncheckstatus.xml',
         'data/odoo_stock_pointer.xml',

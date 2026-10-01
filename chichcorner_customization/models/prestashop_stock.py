@@ -476,7 +476,7 @@ class PrestashopStockCron(models.Model):
         return True
 
     @api.model
-    def get_products_from_stock_move_lines(self, minutes_ago=35):
+    def get_products_from_stock_move_lines(self, minutes_ago=5):
         """Get products affected by stock moves in last X minutes"""
         time_threshold = datetime.now() - timedelta(minutes=minutes_ago)
         time_threshold2 = datetime.now() + timedelta(minutes=minutes_ago)
