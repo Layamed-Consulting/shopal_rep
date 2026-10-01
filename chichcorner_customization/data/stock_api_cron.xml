@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <record id="ir_cron_export_stock_daily" model="ir.cron">
+            <field name="name">Export quotidien stock</field>
+            <field name="model_id" ref="model_stock_export_cron"/>
+            <field name="state">code</field>
+            <field name="code">env['stock.export.cron'].run_daily_export()</field>
+            <field name="interval_number">1</field>
+            <field name="interval_type">days</field>
+            <field name="numbercall">-1</field>
+            <field name="active">True</field>
+        </record>
+    </data>
+</odoo>
