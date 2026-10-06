@@ -261,16 +261,16 @@ class PosSalesExportAPI(http.Controller):
             sales_data.append({
                 "StoreCode": rec.x_studio_storecode or "",
                 "CreatedDate": rec.x_studio_createddate_1,
-                "LastUpdatedDate": rec.x_studio_lastupdateddate_1,
+                "LastUpdatedDate": rec.x_studio_createddate_1,
                 "InvoiceNo": rec.x_studio_invoiceno,
-                "InvoiceItemNo": rec.x_studio_invoiceitemno,
+                "InvoiceItemNo": int(float(rec.x_studio_invoiceitemno or 0)),
                 "TransactionType": rec.x_studio_transactiontype,
                 "Barcode": rec.x_studio_barcode,
-                "SalesAmount": rec.x_studio_salesamount,
+                "SalesAmount": float(rec.x_studio_salesamount or 0),
                 "Currency": rec.x_studio_currency,
-                "SalesQuantity": rec.x_studio_salesquantity,
-                "TaxRate": rec.x_studio_taxrate,
-                "InitialSalePrice": rec.x_studio_initialsaleprice,
+                "SalesQuantity": int(float(rec.x_studio_salesquantity or 0)),
+                "TaxRate": float(rec.x_studio_taxrate or 0),
+                "InitialSalePrice": float(rec.x_studio_initialsaleprice or 0),
             })
 
         return sales_data
@@ -347,9 +347,9 @@ class StockDataAPI(http.Controller):
             stock_data.append({
                 "Date": rec.x_studio_date,
                 "StoreCode": rec.x_studio_storecode or "",
-                "WarehouseType": rec.x_studio_warehousetype or "",
+                "WarehouseType": "1000",
                 "Barcode": rec.x_studio_barcode,
-                "Quantity": rec.x_studio_quantity,
+                "Quantity": int(rec.x_studio_quantity or 0),
             })
 
         return stock_data
